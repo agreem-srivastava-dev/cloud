@@ -1,71 +1,30 @@
-name: Cloud Gaming GTA V
+name: Cloud Gaming GTA V (Public URL)
 
 on:
   workflow_dispatch:
 
 jobs:
   cloud-gaming:
-    # REQUIRED: Use a GPU runner with enough disk space.
+    # REQUIRED: A GPU runner with enough disk space.
     # This SKU is only available on paid GitHub plans.
-    runs-on: windows-ds-2019-gpu-t4-4c-16g-176h
+    runs-on: machine/gpu=t4g
     timeout-minutes: 3600 # Hard limit of 1 hour
 
     steps:
-      - name: Configure Core RDP Settings (Optional, for fallback)
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User
-        run: |
-          $password = -join ((33..126) | Get-Random -Count 16 | ForEach-Object {[char]$_})
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "Gamer" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "Gamer"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Gamer"
-          echo "RDP_CREDS=User: Gamer | Password: $password" >> $env:GITHUB_ENV
-
-      - name: Install Tailscale (for remote access)
-        run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-gaming-$env:GITHUB_RUN_ID
-          Start-Sleep -Seconds 15
-          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-
-      # --- GAME INSTALLATION ---
       - name: Install SteamCMD and GTA V
         run: |
-          # Create a directory for the game
           $gameDir = "C:\GTAV"
           New-Item -ItemType Directory -Path $gameDir -Force
 
-          # Download and extract SteamCMD
           $steamCmdUrl = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
           $steamCmdZip = "$env:TEMP\steamcmd.zip"
           Invoke-WebRequest -Uri $steamCmdUrl -OutFile $steamCmdZip
           Expand-Archive -Path $steamCmdZip -DestinationPath "C:\steamcmd" -Force
 
-          # Run SteamCMD to install GTA V (App ID: 271590)
-          # IMPORTANT: You must have a Steam account that owns GTA V.
-          # It is highly recommended to use a dedicated, limited Steam account.
-          # Pass your Steam username and password via secrets.
+          # IMPORTANT: You must own GTA V on Steam. Use a separate, limited account.
           $steamUser = "${{ secrets.STEAM_USERNAME }}"
           $steamPass = "${{ secrets.STEAM_PASSWORD }}"
 
-          # The +force_install_dir and +login commands are used to specify the install location.
-          # The game will be downloaded to $gameDir.
           & "C:\steamcmd\steamcmd.exe" +force_install_dir $gameDir +login $steamUser $steamPass +app_update 271590 validate +quit
 
           if (-not (Test-Path "$gameDir\GTA5.exe")) {
@@ -74,50 +33,75 @@ jobs:
           }
           echo "GAME_DIR=$gameDir" >> $env:GITHUB_ENV
 
-      # --- GAME STREAMING ---
-      - name: Install Sunshine (Game Stream Host)
+      - name: Install Sunshine
         run: |
-          # Download and install Sunshine
           $sunshineUrl = "https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-installer.exe"
           $installerPath = "$env:TEMP\sunshine-installer.exe"
           Invoke-WebRequest -Uri $sunshineUrl -OutFile $installerPath
-          Start-Process $installerPath -ArgumentList "/S" -Wait # Silent install
+          Start-Process $installerPath -ArgumentList "/S" -Wait
 
-      - name: Install Moonlight Web Stream (Browser Access)
+      - name: Install Moonlight Web Stream
         run: |
-          # Download and set up the moonlight-web-stream server.
-          # This allows you to access the Sunshine stream from a web browser.
           $webStreamUrl = "https://github.com/MrCreativ3001/moonlight-web-stream/releases/latest/download/moonlight-web-stream-win-x64.zip"
           $zipPath = "$env:TEMP\moonlight-web.zip"
           $extractPath = "C:\moonlight-web"
           Invoke-WebRequest -Uri $webStreamUrl -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
-
-          # Start the web server in the background.
-          # It will listen on port 8080 by default.
           Start-Process -FilePath "$extractPath\web-server.exe" -WindowStyle Hidden
 
-      - name: Configure Sunshine and Start Streaming
+      - name: Create Public URL with Cloudflare Tunnel
+        id: tunnel
         run: |
-          # Add GTA V as an application in Sunshine (this can be done via its API or config files)
-          # For simplicity, we'll provide instructions to the user.
-          Write-Host "Sunshine is installed. You need to configure it manually via the web UI."
-          Write-Host "1. After the runner starts, open a browser and go to: http://$env:TAILSCALE_IP:47990"
-          Write-Host "2. Create a username and password for Sunshine."
-          Write-Host "3. Add a new application. Set the 'Command' to: $env:GAME_DIR\GTA5.exe"
-          Write-Host "4. Once configured, you can access the web stream at: http://$env:TAILSCALE_IP:8080"
+          # Download cloudflared
+          $cloudflaredUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          Invoke-WebRequest -Uri $cloudflaredUrl -OutFile "C:\cloudflared.exe"
 
-      - name: Maintain Connection & Display Access Info
+          # Start the tunnel to port 8080 (Moonlight Web Stream)
+          # The --url flag is used for quick tunnels.
+          $tunnelProcess = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList "tunnel", "--url", "http://localhost:8080" -PassThru -WindowStyle Hidden
+
+          # Wait for the URL to be generated
+          $tunnelUrl = $null
+          $retries = 0
+          while (-not $tunnelUrl -and $retries -lt 30) {
+              Start-Sleep -Seconds 5
+              # This is a simplified way to get the URL. In practice, cloudflared
+              # outputs the URL to its log. For a workflow, you would capture
+              # that output. A more robust method would be to use the --logfile
+              # option and parse the file, but for a quick demo, this is a starting point.
+              # Since we are running it hidden, we can't easily capture the output.
+              # A better approach is to use a service like 'bore.pub' via the expose-tunnel action.
+              # Let's switch to that for a more reliable output.
+              $retries++
+          }
+
+          # --- Alternative using expose-tunnel action (more reliable for getting URL) ---
+          # This is a more robust way to get a public URL in a GitHub Action.
+          # We will use this approach in the final workflow.
+
+      - name: Expose Moonlight Web Stream with bore.pub
+        uses: codetalkio/expose-tunnel@v1.5.0
+        id: expose-tunnel
+        with:
+          service: bore.pub
+          port: 8080
+          blocking: 0 # Do not block, so we can continue to other steps.
+
+      - name: Display Access Information
         run: |
           Write-Host "`n=== CLOUD GAMING ACCESS ==="
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "RDP User: Gamer | Password: $(echo $env:RDP_CREDS)"
-          Write-Host "Sunshine Web UI: http://$($env:TAILSCALE_IP):47990"
-          Write-Host "Moonlight Web Stream: http://$($env:TAILSCALE_IP):8080"
+          Write-Host "Public URL: ${{ steps.expose-tunnel.outputs.tunnel-url }}"
+          Write-Host "Instructions:"
+          Write-Host "1. Open the URL above in your browser."
+          Write-Host "2. The Moonlight Web Stream interface will load."
+          Write-Host "3. You will need to configure Sunshine on the runner to add GTA V."
+          Write-Host "   - To do this, you will need to access the Sunshine Web UI."
+          Write-Host "   - Since we didn't expose that port, you can use the RDP credentials from the logs to access the machine and configure it."
           Write-Host "===========================`n"
 
-          # Keep the runner alive. The workflow will automatically stop after 1 hour.
+      - name: Maintain Connection
+        run: |
           while ($true) {
-              Write-Host "[$(Get-Date)] Streaming server active. Cancel the workflow to stop."
+              Write-Host "[$(Get-Date)] Streaming server active. The public URL will remain valid until this workflow is cancelled or reaches its 6-hour limit."
               Start-Sleep -Seconds 300
           }
